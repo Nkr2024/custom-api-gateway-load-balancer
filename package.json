@@ -1,0 +1,20 @@
+{
+  "name": "project_api_gateway",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "gateway": "node gateway/server.js",
+    "server1": "node backend/server1.js",
+    "server2": "node backend/server2.js",
+    "server3": "node backend/server3.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  }
+}
