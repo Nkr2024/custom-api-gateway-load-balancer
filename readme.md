@@ -4,24 +4,97 @@ A backend infrastructure project built using Node.js and Express.js that acts as
 
 The project demonstrates core concepts such as load balancing, health checks, caching, rate limiting, request forwarding, logging, and metrics.
 
-## How It Works
+## System Architecture
 
-```text
-Client
-   |
-   v
-API Gateway
-   |
-   v
-Load Balancer
-   |
-   +--------+--------+
-   |        |        |
-   v        v        v
-Server 1  Server 2  Server 3
+```mermaid
+flowchart TD
+    Client(["Client (Browser / Mobile / cURL)"]) -->|"HTTP Requests (Port 8000)"| Gateway["Custom API Gateway (Port 8000)"]
+    
+    subgraph GatewayCore ["API Gateway Core Engine"]
+        RL["1. IP Rate Limiter<br/>(Fixed Window / RFC Headers)"]
+        Cache["2. LRU Cache with TTL<br/>(O(1) Map Eviction)"]
+        LB["3. Load Balancer<br/>(Round-Robin / Least-Connections)"]
+        HC["4. Active Health Checker<br/>(5s Heartbeat Probes via AbortController)"]
+        Metrics["5. Telemetry & Metrics Engine"]
+    end
+
+    Gateway --> RL
+    RL -->|"Within Quota"| Cache
+    Cache -->|"Cache Miss"| LB
+    
+    HC -.->|"Probes /health"| S1["Backend Server 1<br/>(Port 5001)"]
+    HC -.->|"Probes /health"| S2["Backend Server 2<br/>(Port 5002)"]
+    HC -.->|"Probes /health"| S3["Backend Server 3<br/>(Port 5003)"]
+
+    LB -->|"Forwards Request"| S1
+    LB -->|"Forwards Request"| S2
+    LB -->|"Forwards Request"| S3
 ```
 
-The client sends requests to the API Gateway. The gateway checks the rate limit and cache, selects a healthy backend server, forwards the request, and returns the server response to the client.
+## Request Lifecycle Flowchart
+
+The following sequence diagram details the exact chronological execution of every incoming HTTP request through the gateway:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant GW as API Gateway (server.js)
+    participant RL as RateLimiter (rateLimiter.js)
+    participant Cache as LRUCache (cache.js)
+    participant LB as LoadBalancer (loadBalancer.js)
+    participant Backend as Upstream Server (5001/5002/5003)
+
+    Client->>GW: HTTP Request (e.g. GET /api/products)
+    GW->>GW: 1. Record Metrics & Extract Client IP
+    GW->>RL: 2. Check Rate Limit: isAllowed(clientIp)
+    
+    alt Rate Limit Exceeded
+        RL-->>GW: Limit Exceeded (remaining: 0, retryAfterMs)
+        GW-->>Client: 429 Too Many Requests (Retry-After header)
+    else Request Permitted
+        RL-->>GW: Allowed (X-RateLimit headers)
+        GW->>Cache: 3. Check Cache: isCacheableRequest && get(key)
+        
+        alt Cache HIT
+            Cache-->>GW: Return Cached Response
+            GW-->>Client: 200 OK (X-Cache: HIT) [Short-Circuit]
+        else Cache MISS
+            Cache-->>GW: Cache Miss
+            GW->>LB: 4. Select Server: getNextServer()
+            
+            alt No Healthy Servers Available
+                LB-->>GW: null
+                GW-->>Client: 503 Service Unavailable
+            else Healthy Server Selected
+                LB-->>GW: targetServer (e.g. Server 2)
+                GW->>LB: 5. Track Concurrency: startRequest(server)
+                GW->>Backend: 6. Forward Request: fetch(targetUrl)
+                Backend-->>GW: 7. Backend Response Received
+                
+                opt If GET and 2xx Status
+                    GW->>Cache: 8. Store in LRU Cache: set(key, response)
+                end
+                opt If POST / PUT / PATCH / DELETE
+                    GW->>Cache: Invalidate path cache: deleteByPath(path)
+                end
+                
+                GW->>LB: 9. Release Concurrency: completeRequest(server) [finally]
+                GW-->>Client: 10. Send Response (X-Cache: MISS)
+            end
+        end
+    end
+```
+
+### Chronological Request Execution
+
+1. **Ingress & Telemetry:** Increments total request metrics and captures the client IP from `X-Forwarded-For` or TCP socket.
+2. **Rate Limit Gatekeeper:** Evaluates the IP against configured window thresholds. If exhausted, short-circuits execution with HTTP `429 Too Many Requests` and `Retry-After` headers.
+3. **Cache Short-Circuit:** Evaluates if the request is an idempotent `GET`. If a valid unexpired entry exists in the LRU Map, returns cached JSON immediately with `X-Cache: HIT` without touching upstream servers.
+4. **Server Selection:** Filters the backend server pool using `server.healthy` state (actively maintained by background health probes) and selects an instance via `round-robin` or `least-connections`.
+5. **In-Flight Concurrency Tracking:** Increments `server.activeRequests` and `server.totalForwarded` before dispatching.
+6. **Network Forwarding & Synchronization:** Forwards the HTTP request to the target server via `fetch()`. Upon receipt, stores successful GET responses in cache or invalidates matching path entries on write requests (POST/PUT/PATCH/DELETE).
+7. **Guaranteed Cleanup:** Decrements `server.activeRequests` inside a `finally` block, guaranteeing that connection counters never drift even during network timeouts or downstream crashes.
 
 ## Features
 
